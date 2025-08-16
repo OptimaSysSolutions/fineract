@@ -1,0 +1,31 @@
+﻿replicas: 1
+image:
+  repository: "default-repo/audit-trail-service"
+  tag: "v3.0.0"
+env:
+  - name: TZ
+    value: "Africa/Harare"
+
+resources:
+  limits:
+    memory: "4Gi"
+    cpu: "1500m"
+  requests:
+    memory: "512Mi"
+    cpu: "250m"
+
+namespace:
+  hostname: "default-host"
+  name: "default-namespace"
+
+
+hpa:
+  enabled: "false"
+  minReplicas: 1
+  maxReplicas: 1
+  targetCPUUtilizationPercentage: 80
+
+service:
+  name: "fineract-provider"
+  containerPort: 8443
+  ingressPath: /fineract(/|$)(.*)

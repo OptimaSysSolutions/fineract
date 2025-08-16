@@ -1,0 +1,202 @@
+name: Fineract Provider Build and Deploy
+
+on:
+  push:
+    branches:
+      - develop
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-deploy:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Version determination
+      - name: Determine version and environment
+        id: version_env
+        run: |
+          # Extract version from properties file
+          CURRENT_VERSION=$(grep '^fineract-provider=' .github/variables/version.properties | cut -d '=' -f 2)
+          if [ -z "$CURRENT_VERSION" ]; then
+            echo "Error: No version found for fineract-provider in version.properties"
+            CURRENT_VERSION="0.0.1"
+          fi
+          echo "chart_version=$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Chart version: $CURRENT_VERSION"
+          
+          # Determine environment based on branch
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            ENVIRONMENT="dev"
+          elif [[ "${{ github.ref }}" == refs/heads/release/* ]]; then
+            ENVIRONMENT="prod"
+          else
+            ENVIRONMENT="dev"
+          fi
+          echo "environment=$ENVIRONMENT" >> "$GITHUB_OUTPUT"
+          echo "Environment: $ENVIRONMENT"
+
+      # Java build and Docker image creation
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/gradle-build-action@v3
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+
+      - name: Build Gradle Project
+        run: ./gradlew :fineract-provider:build
+
+      - name: Verify build artifacts
+        working-directory: fineract-provider
+        run: |
+          ls -l
+          cd build/libs
+          echo "Build artifacts in build/libs:"
+          ls -l
+
+      - name: Log in to Harbor Registry
+        run: |
+          echo '${{ secrets.HARBOR_PASSWORD }}' | docker login ${{ vars.HARBOR_REGISTRY }} -u '${{ secrets.HARBOR_USERNAME }}' --password-stdin
+
+      - name: Build and Push Docker Image
+        working-directory: fineract-provider
+        run: |
+          docker build -t ${{ vars.HARBOR_REGISTRY }}/${{ vars.HARBOR_PROJECT }}/fineract-provider:${{ steps.version_env.outputs.chart_version }} .
+          docker push ${{ vars.HARBOR_REGISTRY }}/${{ vars.HARBOR_PROJECT }}/fineract-provider:${{ steps.version_env.outputs.chart_version }}
+
+      # Helm packaging
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: af-south-1
+
+      - name: Package Helm Chart
+        working-directory: helm
+        run: |
+          echo "Creating env folder for fineract-provider"
+          mkdir -p fineract-provider/env
+          
+          echo "Creating charts folder for fineract-provider"
+          mkdir -p fineract-provider/charts
+          
+          echo "Copying env files to the chart folder"
+          cp -r env/* fineract-provider/env/ || true
+          
+          echo "Packaging Helm chart"
+          helm package fineract-provider \
+            --version ${{ steps.version_env.outputs.chart_version }} \
+            --app-version ${{ steps.version_env.outputs.chart_version }}
+          
+          echo "Packaged files:"
+          ls -l
+
+      - name: Upload Helm Chart to S3
+        working-directory: helm
+        run: |
+          aws s3 cp fineract-provider-${{ steps.version_env.outputs.chart_version }}.tgz \
+            s3://${{ vars.S3_BUCKET }}/charts/fineract-provider/fineract-provider-${{ steps.version_env.outputs.chart_version }}.tgz
+
+      # Kubernetes deployment
+      - name: Deploy to Kubernetes
+        uses: appleboy/ssh-action@v0.1.6
+        with:
+          host: ${{ secrets.REMOTE_HOST }}
+          username: ${{ secrets.REMOTE_USERNAME }}
+          password: ${{ secrets.REMOTE_PASSWORD }}
+          port: ${{ secrets.REMOTE_SSH_PORT }}
+          envs: |
+            AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }},
+            AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }},
+            AWS_REGION=af-south-1
+          script: |
+            # Install dependencies
+            sudo apt-get update -y
+            
+            if ! command -v unzip &> /dev/null; then
+              echo "Installing unzip..."
+              sudo apt-get install -y unzip
+            fi
+            
+            if ! command -v aws &> /dev/null; then
+              echo "Installing AWS CLI..."
+              curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+              unzip awscliv2.zip
+              sudo ./aws/install
+              rm -rf awscliv2.zip aws/
+            fi
+            
+            # Create Harbor credentials secret
+            echo "Creating Harbor credentials secret..."
+            if ! kubectl get secret harbor-credentials -n ${{ vars.K8S_NAMESPACE }}; then
+                echo "Creating new Harbor credentials secret..."
+            else
+                echo "Updating existing Harbor credentials secret..."
+                kubectl delete secret harbor-credentials -n ${{ vars.K8S_NAMESPACE }}
+            fi
+            kubectl create secret docker-registry harbor-credentials \
+              --docker-server=${{ vars.HARBOR_REGISTRY }} \
+              --docker-username='${{ secrets.HARBOR_USERNAME }}' \
+              --docker-password='${{ secrets.HARBOR_PASSWORD }}' \
+              -n ${{ vars.K8S_NAMESPACE }}
+            
+            # Download and deploy Helm chart
+            echo "Downloading Helm chart from S3..."
+            aws s3 cp s3://${{ vars.S3_BUCKET }}/charts/fineract-provider/fineract-provider-${{ steps.version_env.outputs.chart_version }}.tgz ./
+            
+            echo "Extracting Helm chart..."
+            tar -xzvf fineract-provider-${{ steps.version_env.outputs.chart_version }}.tgz
+            
+            echo "Deploying Helm chart..."
+            helm upgrade --install fineract-provider \
+              ./fineract-provider-${{ steps.version_env.outputs.chart_version }}.tgz \
+              --namespace ${{ vars.K8S_NAMESPACE }} \
+              --create-namespace \
+              -f fineract-provider/values.yml \
+              -f fineract-provider/env/${{ steps.version_env.outputs.environment }}.yml \
+              -f fineract-provider/environments/values-${{ steps.version_env.outputs.environment }}.yml \
+              --force \
+              --set image.repository=${{ vars.HARBOR_REGISTRY }}/${{ vars.HARBOR_PROJECT }}/fineract-provider,image.tag=${{ steps.version_env.outputs.chart_version }}
+            
+            echo "Deployment completed successfully!"
+
+      # Update version in properties file
+      - name: Update version in properties file
+        run: |
+          # Get current version
+          CURRENT_VERSION="${{ steps.version_env.outputs.chart_version }}"
+          
+          # Parse version components
+          IFS='.' read -ra VERSION_PARTS <<< "$CURRENT_VERSION"
+          MAJOR=${VERSION_PARTS[0]}
+          MINOR=${VERSION_PARTS[1]}
+          PATCH=${VERSION_PARTS[2]}
+          
+          # Increment patch version
+          NEW_PATCH=$((PATCH + 1))
+          NEW_VERSION="$MAJOR.$MINOR.$NEW_PATCH"
+          
+          echo "Updating version from $CURRENT_VERSION to $NEW_VERSION"
+          
+          # Update the properties file
+          sed -i "s/^fineract-provider=.*/fineract-provider=$NEW_VERSION/" .github/variables/version.properties
+          
+          # Configure git
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          # Commit and push changes
+          git add .github/variables/version.properties
+          git commit -m "Update fineract-provider version to $NEW_VERSION [skip ci]"
+          git push

@@ -1,0 +1,23 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Values.service.name }}
+  namespace: {{ .Values.namespace.name }}
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/proxy-ssl-verify: "off"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: {{ .Values.namespace.hostname }}
+      http:
+        paths:
+          - path: {{ .Values.service.ingressPath }}
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: {{ .Values.service.name }}
+                port:
+                  number: 8443

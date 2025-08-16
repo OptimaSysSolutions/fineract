@@ -1,0 +1,5 @@
+﻿apiVersion: v2
+name: fineract-provider
+description: Fineract Provider
+type: application
+version: 1.0.0
