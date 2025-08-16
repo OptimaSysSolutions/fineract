@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   determine_version:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     outputs:
       chart_version: ${{ steps.extract_version.outputs.chart_version }}
       environment: ${{ steps.determine_environment.outputs.env }}
@@ -46,7 +46,7 @@ jobs:
           echo "Environment Determined is ${{ env.env }}"
 
   variables_check:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: determine_version
     environment: ${{ needs.determine_version.outputs.environment }}
     steps:
@@ -57,7 +57,7 @@ jobs:
           echo "Chart version from the env : ${{ env.chart_version }}"
 
   build:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: determine_version
     environment: ${{ needs.determine_version.outputs.environment }}
     steps:
@@ -98,7 +98,7 @@ jobs:
           docker push ${{ vars.HARBOR_REGISTRY }}/${{ vars.HARBOR_PROJECT }}/fineract-provider:${{ needs.determine_version.outputs.chart_version }}
 
   helm:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: determine_version
     environment: ${{ needs.determine_version.outputs.environment }}
     steps:
@@ -139,7 +139,7 @@ jobs:
             s3://${{ vars.S3_BUCKET }}/charts/fineract-provider/fineract-provider-${{ needs.determine_version.outputs.chart_version }}.tgz
 
   deploy:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs:
       - build
       - helm
@@ -212,7 +212,7 @@ jobs:
             echo "Deployment completed successfully!"
 
   write_version:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs:
       - deploy
       - variables_check
