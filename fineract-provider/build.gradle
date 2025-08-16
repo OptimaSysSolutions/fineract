@@ -253,11 +253,20 @@ jib {
     }
 
     to {
-        image = 'fineract'
+        image = System.getenv('HARBOR_REGISTRY') && System.getenv('HARBOR_PROJECT') ?
+               "${System.getenv('HARBOR_REGISTRY')}/${System.getenv('HARBOR_PROJECT')}/fineract-provider" :
+               'fineract-provider'
         tags = [
-            "${project.version}",
+            System.getenv('IMAGE_VERSION') ?: "${project.version}",
             'latest'
         ]
+        // Only configure auth if credentials are provided
+        if (System.getenv('HARBOR_USERNAME') || project.findProperty('harborUsername')) {
+            auth {
+                username = System.getenv('HARBOR_USERNAME') ?: project.findProperty('harborUsername')
+                password = System.getenv('HARBOR_PASSWORD') ?: project.findProperty('harborPassword')
+            }
+        }
     }
 
     container {
