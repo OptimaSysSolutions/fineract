@@ -10,17 +10,18 @@ permissions:
   contents: write
 
 jobs:
-  build-and-deploy:
+  determine_version:
     runs-on: self-hosted
+    outputs:
+      chart_version: ${{ steps.extract_version.outputs.chart_version }}
+      environment: ${{ steps.determine_environment.outputs.env }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Version determination
-      - name: Determine version and environment
-        id: version_env
+      - id: extract_version
+        name: "Extract Version"
         run: |
-          # Extract version from properties file
           CURRENT_VERSION=$(grep '^fineract-provider=' .github/variables/version.properties | cut -d '=' -f 2)
           if [ -z "$CURRENT_VERSION" ]; then
             echo "Error: No version found for fineract-provider in version.properties"
@@ -28,19 +29,41 @@ jobs:
           fi
           echo "chart_version=$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
           echo "Chart version: $CURRENT_VERSION"
-          
-          # Determine environment based on branch
-          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            ENVIRONMENT="dev"
-          elif [[ "${{ github.ref }}" == refs/heads/release/* ]]; then
-            ENVIRONMENT="prod"
-          else
-            ENVIRONMENT="dev"
-          fi
-          echo "environment=$ENVIRONMENT" >> "$GITHUB_OUTPUT"
-          echo "Environment: $ENVIRONMENT"
 
-      # Java build and Docker image creation
+      - id: determine_environment
+        name: Determine Environment
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "env=dev" >> "$GITHUB_ENV"
+            echo "env=dev" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.ref }}" == refs/heads/release/* ]]; then
+            echo "env=prod" >> "$GITHUB_ENV"
+            echo "env=prod" >> "$GITHUB_OUTPUT"
+          else
+            echo "env=dev" >> "$GITHUB_ENV"
+            echo "env=dev" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Environment Determined is ${{ env.env }}"
+
+  variables_check:
+    runs-on: self-hosted
+    needs: determine_version
+    environment: ${{ needs.determine_version.outputs.environment }}
+    steps:
+      - name: Print Chart Versions
+        run: |
+          echo "Chart version from the outputs : ${{ needs.determine_version.outputs.chart_version }}"
+          echo "chart_version=${{ needs.determine_version.outputs.chart_version }}" >> $GITHUB_ENV
+          echo "Chart version from the env : ${{ env.chart_version }}"
+
+  build:
+    runs-on: self-hosted
+    needs: determine_version
+    environment: ${{ needs.determine_version.outputs.environment }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
@@ -71,10 +94,17 @@ jobs:
       - name: Build and Push Docker Image
         working-directory: fineract-provider
         run: |
-          docker build -t ${{ vars.HARBOR_REGISTRY }}/${{ vars.HARBOR_PROJECT }}/fineract-provider:${{ steps.version_env.outputs.chart_version }} .
-          docker push ${{ vars.HARBOR_REGISTRY }}/${{ vars.HARBOR_PROJECT }}/fineract-provider:${{ steps.version_env.outputs.chart_version }}
+          docker build -t ${{ vars.HARBOR_REGISTRY }}/${{ vars.HARBOR_PROJECT }}/fineract-provider:${{ needs.determine_version.outputs.chart_version }} .
+          docker push ${{ vars.HARBOR_REGISTRY }}/${{ vars.HARBOR_PROJECT }}/fineract-provider:${{ needs.determine_version.outputs.chart_version }}
 
-      # Helm packaging
+  helm:
+    runs-on: self-hosted
+    needs: determine_version
+    environment: ${{ needs.determine_version.outputs.environment }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -96,8 +126,8 @@ jobs:
           
           echo "Packaging Helm chart"
           helm package fineract-provider \
-            --version ${{ steps.version_env.outputs.chart_version }} \
-            --app-version ${{ steps.version_env.outputs.chart_version }}
+            --version ${{ needs.determine_version.outputs.chart_version }} \
+            --app-version ${{ needs.determine_version.outputs.chart_version }}
           
           echo "Packaged files:"
           ls -l
@@ -105,10 +135,20 @@ jobs:
       - name: Upload Helm Chart to S3
         working-directory: helm
         run: |
-          aws s3 cp fineract-provider-${{ steps.version_env.outputs.chart_version }}.tgz \
-            s3://${{ vars.S3_BUCKET }}/charts/fineract-provider/fineract-provider-${{ steps.version_env.outputs.chart_version }}.tgz
+          aws s3 cp fineract-provider-${{ needs.determine_version.outputs.chart_version }}.tgz \
+            s3://${{ vars.S3_BUCKET }}/charts/fineract-provider/fineract-provider-${{ needs.determine_version.outputs.chart_version }}.tgz
 
-      # Kubernetes deployment
+  deploy:
+    runs-on: self-hosted
+    needs:
+      - build
+      - helm
+      - determine_version
+    environment: ${{ needs.determine_version.outputs.environment }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Deploy to Kubernetes
         uses: appleboy/ssh-action@v0.1.6
         with:
@@ -153,29 +193,38 @@ jobs:
             
             # Download and deploy Helm chart
             echo "Downloading Helm chart from S3..."
-            aws s3 cp s3://${{ vars.S3_BUCKET }}/charts/fineract-provider/fineract-provider-${{ steps.version_env.outputs.chart_version }}.tgz ./
+            aws s3 cp s3://${{ vars.S3_BUCKET }}/charts/fineract-provider/fineract-provider-${{ needs.determine_version.outputs.chart_version }}.tgz ./
             
             echo "Extracting Helm chart..."
-            tar -xzvf fineract-provider-${{ steps.version_env.outputs.chart_version }}.tgz
+            tar -xzvf fineract-provider-${{ needs.determine_version.outputs.chart_version }}.tgz
             
             echo "Deploying Helm chart..."
             helm upgrade --install fineract-provider \
-              ./fineract-provider-${{ steps.version_env.outputs.chart_version }}.tgz \
+              ./fineract-provider-${{ needs.determine_version.outputs.chart_version }}.tgz \
               --namespace ${{ vars.K8S_NAMESPACE }} \
               --create-namespace \
               -f fineract-provider/values.yml \
-              -f fineract-provider/env/${{ steps.version_env.outputs.environment }}.yml \
-              -f fineract-provider/environments/values-${{ steps.version_env.outputs.environment }}.yml \
+              -f fineract-provider/env/${{ needs.determine_version.outputs.environment }}.yml \
+              -f fineract-provider/environments/values-${{ needs.determine_version.outputs.environment }}.yml \
               --force \
-              --set image.repository=${{ vars.HARBOR_REGISTRY }}/${{ vars.HARBOR_PROJECT }}/fineract-provider,image.tag=${{ steps.version_env.outputs.chart_version }}
+              --set image.repository=${{ vars.HARBOR_REGISTRY }}/${{ vars.HARBOR_PROJECT }}/fineract-provider,image.tag=${{ needs.determine_version.outputs.chart_version }}
             
             echo "Deployment completed successfully!"
 
-      # Update version in properties file
+  write_version:
+    runs-on: self-hosted
+    needs:
+      - deploy
+      - variables_check
+      - determine_version
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Update version in properties file
         run: |
           # Get current version
-          CURRENT_VERSION="${{ steps.version_env.outputs.chart_version }}"
+          CURRENT_VERSION="${{ needs.determine_version.outputs.chart_version }}"
           
           # Parse version components
           IFS='.' read -ra VERSION_PARTS <<< "$CURRENT_VERSION"
